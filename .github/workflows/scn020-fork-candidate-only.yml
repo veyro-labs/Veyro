@@ -1,0 +1,31 @@
+# Disposable SCN-020(i) candidate-only malicious-pattern probe; NEVER merge.
+# This definition is on the untrusted fork head, absent from trusted default main.
+name: scn020-fork-candidate-only
+on:
+  pull_request_target:
+    branches: [scn020-protected-base-20261009]
+permissions:
+  contents: read
+jobs:
+  candidate-probe:
+    runs-on: ubuntu-24.04
+    environment: scn020-sacrificial-canary-20261009
+    steps:
+      - name: Attempt fork-ref execution with test-only environment canary
+        env:
+          SCN020_CANARY: ${{ secrets.SCN020_TEST_ONLY_CANARY }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SCN020_CANARY"
+          test "$HEAD_REPO" = "veyro-labs/Veyro"
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          git init -q "$work"
+          git -C "$work" fetch -q --no-tags --depth=1 "https://github.com/$HEAD_REPO.git" "$HEAD_SHA"
+          git -C "$work" checkout -q --detach FETCH_HEAD
+          python3 "$work/backend/app/_scn020_fork_event.py"
+          echo SCN020_CANDIDATE_WORKFLOW_EXECUTED_WITH_TEST_ONLY_CANARY
