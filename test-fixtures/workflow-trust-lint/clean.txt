@@ -1,0 +1,1 @@
+Synthetic clean workflow-trust PR fixture; no credentials or production data.

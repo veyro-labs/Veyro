@@ -1,0 +1,15 @@
+name: p24-synthetic-forkhead-canary
+on:
+  pull_request_target:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  synthetic-hazard:
+    runs-on: ubuntu-24.04
+    env:
+      CANARY: ${{ secrets.P24_SYNTHETIC_CANARY }}
+    steps:
+      - name: Synthetic candidate fork-head attempt
+        shell: bash
+        run: git checkout "${{ github.event.pull_request.head.sha }}"
