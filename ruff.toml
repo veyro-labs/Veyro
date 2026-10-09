@@ -1,0 +1,2 @@
+# Match the existing backend Ruff width for repository-level checks.
+line-length = 100

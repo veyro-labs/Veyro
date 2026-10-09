@@ -1,0 +1,359 @@
+# M1-C-06 - synthetic-only CI qualification drill for gitleaks 8.30.1 (CAP-009
+# shape) and Ruff 0.16.9 S608 (CAP-010 shape), stage 5 of CAPABILITY_POLICY.md.
+#
+# Authority: `M1-C-06-CAPABILITY-SECURITY-DETERMINATION-2026-10-09.md` (bounded
+# synthetic-drill scope), `M1-C-06-GOVERNED-SHAPE-SYNTHETIC-QUALIFICATION-
+# 2026-10-09.md` (governed invocation shapes) and `M1-C-06-UPSTREAM-PROVENANCE-
+# PINS-2026-10-09.md` (artifact pins).
+#
+# This is NOT a real-tree scanner gate, NOT a required status check and NOT a
+# trust anchor. Every scanner target and cwd is a file this job generates under
+# RUNNER_TEMP; the checkout is sparse and supplies only the two committed Ruff
+# config files, read via `--config` (never a target). No Veyro file, index,
+# history or checkout is scanned.
+#
+# Constraints held by construction: no action references, no secret
+# references, `contents: read` only, tokenless fetch of the public fork, no
+# unpinned package install (artifacts are SHA-256 verified before extraction).
+#
+# Runs only on a push to the exact disposable fork branch below. Not run yet;
+# no CI or scenario PASS is claimed until a live job is read.
+
+name: c06-synthetic-scanner-qualification
+
+on:
+  push:
+    branches:
+      - ci/c06-qual-20261009
+
+permissions:
+  contents: read
+
+jobs:
+  c06-synthetic-scanner-qualification:
+    name: c06-synthetic-scanner-qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Fetch exact commit (tokenless, config files only) and verify GITHUB_SHA
+        env:
+          PUSH_SHA: ${{ github.sha }}
+          PUSH_REF: ${{ github.ref }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PUSH_REF" == "refs/heads/ci/c06-qual-20261009" ]] \
+            || { echo "DENY: ref is not the disposable branch" >&2; exit 1; }
+          [[ "$PUSH_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "DENY: sha is not 40-hex" >&2; exit 1; }
+          git init -q "$RUNNER_TEMP/head"
+          git -C "$RUNNER_TEMP/head" sparse-checkout set --no-cone /ruff.toml /backend/pyproject.toml
+          git -C "$RUNNER_TEMP/head" fetch -q --no-tags --depth=1 "$REPO_URL" "$PUSH_SHA"
+          git -C "$RUNNER_TEMP/head" -c advice.detachedHead=false checkout -q FETCH_HEAD
+          [[ "$(git -C "$RUNNER_TEMP/head" rev-parse HEAD)" == "$PUSH_SHA" ]] \
+            || { echo "DENY: checkout is not $PUSH_SHA" >&2; exit 1; }
+          for f in ruff.toml backend/pyproject.toml; do
+            [[ -f "$RUNNER_TEMP/head/$f" && ! -L "$RUNNER_TEMP/head/$f" ]] \
+              || { echo "DENY: $f is not a regular file" >&2; exit 1; }
+          done
+          echo "pinned sha: $PUSH_SHA"
+
+      - name: Hash-verify pinned artifacts before extraction
+        shell: bash
+        run: |
+          set -euo pipefail
+          dl="$RUNNER_TEMP/dl"
+          mkdir -p "$dl" "$RUNNER_TEMP/bin-gitleaks" "$RUNNER_TEMP/bin-ruff"
+          curl -fsSL --proto '=https' --tlsv1.2 --max-time 120 -o "$dl/gitleaks.tar.gz" \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $dl/gitleaks.tar.gz" \
+            | sha256sum -c -
+          curl -fsSL --proto '=https' --tlsv1.2 --max-time 120 -o "$dl/ruff.whl" \
+            https://files.pythonhosted.org/packages/bc/b8/9c543074918061abbefc3bd139bee22de35abedb00dde0f2d27288838962/ruff-0.16.9-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+          echo "a21713e629d3e5bdb2f5c2def1cc7f04f47fa8e1a7eb0571b4a28e1da64bc728  $dl/ruff.whl" \
+            | sha256sum -c -
+          tar -xzf "$dl/gitleaks.tar.gz" -C "$RUNNER_TEMP/bin-gitleaks" gitleaks
+          python3 -I - "$dl/ruff.whl" "$RUNNER_TEMP/bin-ruff/ruff" <<'PY'
+          import sys
+          import zipfile
+
+          wheel, out = sys.argv[1:3]
+          with zipfile.ZipFile(wheel) as z:
+              data = z.read("ruff-0.16.9.data/scripts/ruff")
+          with open(out, "wb") as handle:
+              handle.write(data)
+          PY
+          chmod 0755 "$RUNNER_TEMP/bin-ruff/ruff"
+          [[ "$("$RUNNER_TEMP/bin-gitleaks/gitleaks" version)" == "8.30.1" ]] \
+            || { echo "DENY: gitleaks version is not 8.30.1" >&2; exit 1; }
+          [[ "$("$RUNNER_TEMP/bin-ruff/ruff" --version)" == "ruff 0.16.9" ]] \
+            || { echo "DENY: ruff version is not 0.16.9" >&2; exit 1; }
+          echo "artifacts verified and versions asserted"
+
+      - name: gitleaks governed shape - synthetic positive, negative, fail-closed, nonvacuity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/scripts" "$RUNNER_TEMP/gl-cwd"
+          cat > "$RUNNER_TEMP/scripts/gl_drill.py" <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          tmp = Path(os.environ["RUNNER_TEMP"]).resolve()
+          head = tmp / "head"
+          gl = str(tmp / "bin-gitleaks" / "gitleaks")
+          root = Path(tempfile.mkdtemp(prefix="gl-drill.", dir=tmp))
+          # EXAMPLE_NOT_A_REAL_KEY: synthetic PAT-shaped value, joined at runtime.
+          token = "ghp_" + "Q7xK2mP9" + "vL4nR8tW" + "3yB6cD1e" + "F5gH0jZs" + "A2uN"
+          banner = "# EXAMPLE_NOT_A_REAL_KEY -- synthetic fixture, not a credential.\n"
+          plain = f'{banner}GITHUB_TOKEN = "{token}"\n'
+          allowed = f'{banner}GITHUB_TOKEN = "{token}"  # gitleaks:allow\n'
+          clean = f"{banner}GREETING = 'hello'\n"
+          failures = []
+
+
+          class Refused(Exception):
+              pass
+
+
+          def check(name, ok):
+              print(("PASS " if ok else "FAIL ") + name)
+              if not ok:
+                  failures.append(name)
+
+
+          def case(name, content=None):
+              target, work = root / name / "target", root / name / "work"
+              target.mkdir(parents=True)
+              work.mkdir()
+              if content is not None:
+                  (target / "p.py").write_text(content)
+              return target, work
+
+
+          def run(tail, target, work):
+              report = work / "report.json"
+              report.unlink(missing_ok=True)
+              argv = [gl, "dir", "--no-banner", "--no-color", "--redact=100", "--exit-code", "42",
+                      "--report-format", "json", "--report-path", str(report), *tail, str(target)]
+              env = {"PATH": "/usr/bin:/bin", "HOME": str(work), "NO_COLOR": "1"}
+              r = subprocess.run(argv, cwd=work, env=env, capture_output=True, text=True, check=False)
+              raw = report.read_text() if report.is_file() else ""
+              leaked = token in raw + r.stdout + r.stderr
+              return r.returncode, (json.loads(raw) if raw else []), leaked, argv
+
+
+          def governed(target, work):
+              if head in [target.resolve(), *target.resolve().parents]:
+                  raise Refused("target inside checkout")
+              if not target.is_dir():
+                  raise Refused("target is not a directory")
+              if not [p for p in target.rglob("*") if p.is_file() and p.stat().st_size > 0]:
+                  raise Refused("zero non-empty files: vacuous scan")
+              if (target / ".gitleaksignore").exists():
+                  raise Refused("target-root .gitleaksignore cannot be disabled by flag")
+              empty = work / "empty-ignore-dir"
+              empty.mkdir(exist_ok=True)
+              return run(["--ignore-gitleaks-allow", "-i", str(empty)], target, work)
+
+
+          def detected(res):
+              rc, found, leaked, _ = res
+              return rc == 42 and len(found) == 1 and found[0]["RuleID"] == "github-pat" and not leaked
+
+
+          def suppressed(res):
+              return res[0] == 0 and res[1] == [] and not res[2]
+
+
+          def refused(fn):
+              try:
+                  fn()
+              except Refused:
+                  return True
+              return False
+
+
+          t, w = case("positive", plain)
+          check("positive: default shape detects github-pat, redacted", detected(run([], t, w)))
+          res = governed(t, w)
+          check("positive: governed shape rc 42, one github-pat, token absent from outputs", detected(res))
+          check("positive: governed argv has no --baseline-path", "--baseline-path" not in res[3])
+          check("positive: finding secret is fully redacted", res[1][0].get("Secret") == "REDACTED")
+
+          t, w = case("negative", clean)
+          res = governed(t, w)
+          check("negative: clean non-empty target -> rc 0, no findings", suppressed(res))
+
+          t, w = case("inline-allow", allowed)
+          check("inline allow: default shape suppressed", suppressed(run([], t, w)))
+          check("inline allow: governed shape detects", detected(governed(t, w)))
+
+          t, w = case("cwd-ignore", plain)
+          cwd_fp = governed(t, w)[1]
+          (w / ".gitleaksignore").write_text(cwd_fp[0]["Fingerprint"] + "\n")
+          check("cwd ignore: default shape suppressed", suppressed(run([], t, w)))
+          check("cwd ignore: governed shape still detects", detected(governed(t, w)))
+
+          t, w = case("baseline", plain)
+          baseline = w / "baseline.json"
+          baseline.write_text(json.dumps(governed(t, w)[1]))
+          check("baseline: default shape with --baseline-path suppressed",
+                suppressed(run(["--baseline-path", str(baseline)], t, w)))
+          check("baseline: governed shape (no baseline flag) detects", detected(governed(t, w)))
+
+          t, w = case("empty-target")
+          check("fail-closed: empty target refused by wrapper", refused(lambda: governed(t, w)))
+
+          t, w = case("root-ignore", plain)
+          (t / ".gitleaksignore").write_text(governed(t, w)[1][0]["Fingerprint"] + "\n")
+          (w / "empty-ignore-dir").mkdir(exist_ok=True)
+          check("fail-closed: target-root ignore suppresses under -i empty dir (why refusal exists)",
+                suppressed(run(["--ignore-gitleaks-allow", "-i", str(w / "empty-ignore-dir")], t, w)))
+          check("fail-closed: target-root .gitleaksignore refused by wrapper",
+                refused(lambda: governed(t, w)))
+
+          t, w = case("missing-target")
+          rc = run([], t / "does-not-exist", w)[0]
+          check(f"fail-closed: missing target is an error exit, not 0/42 (rc={rc})", rc not in (0, 42))
+
+          print(f"failures: {len(failures)}")
+          sys.exit(1 if failures else 0)
+          PY
+          cd "$RUNNER_TEMP/gl-cwd"
+          python3 -I "$RUNNER_TEMP/scripts/gl_drill.py"
+
+      - name: Ruff S608 governed shape - real config, synthetic positive, negative, fail-closed, nonvacuity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/scripts" "$RUNNER_TEMP/ruff-cwd"
+          cat > "$RUNNER_TEMP/scripts/ruff_drill.py" <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          import tempfile
+          import tomllib
+          from pathlib import Path
+
+          tmp = Path(os.environ["RUNNER_TEMP"]).resolve()
+          head = tmp / "head"
+          ruff = str(tmp / "bin-ruff" / "ruff")
+          root = Path(tempfile.mkdtemp(prefix="ruff-drill.", dir=tmp))
+          configs = [head / "ruff.toml", head / "backend" / "pyproject.toml"]
+          bad = 'def f(c, u):\n    q = "SELECT n FROM a WHERE id = " + u\n    c.execute(q)\n'
+          suppressed_src = (
+              'def f(c, u):\n    q = "SELECT n FROM a WHERE id = " + u  # noqa: S608\n    c.execute(q)\n'
+          )
+          clean = 'def f(c, u):\n    c.execute("SELECT n FROM a WHERE id = %s", (u,))\n'
+          failures = []
+
+
+          class Refused(Exception):
+              pass
+
+
+          def check(name, ok):
+              print(("PASS " if ok else "FAIL ") + name)
+              if not ok:
+                  failures.append(name)
+
+
+          def case(name, content=None):
+              target, work = root / cfg.parent.name / name / "target", root / cfg.parent.name / name / "work"
+              target.mkdir(parents=True)
+              work.mkdir()
+              if content is not None:
+                  (target / "m.py").write_text(content)
+              return target, work
+
+
+          def run(config, targets, work, *flags):
+              argv = [ruff, "check", "--config", str(config), "--no-cache", "--no-fix",
+                      "--select", "S", "--output-format", "json", *flags, *map(str, targets)]
+              env = {"PATH": "/usr/bin:/bin", "HOME": str(work), "NO_COLOR": "1", "LC_ALL": "C.UTF-8"}
+              r = subprocess.run(argv, cwd=work, env=env, capture_output=True, text=True, check=False)
+              return r.returncode, r
+
+
+          def codes(r):
+              return {f["code"] for f in json.loads(r.stdout)} if r.stdout.strip() else set()
+
+
+          def governed(config, targets, work):
+              resolved = [t.resolve() for t in targets]
+              for t in [work.resolve(), *resolved]:
+                  if head in [t, *t.parents]:
+                      raise Refused("path inside checkout")
+              for t in resolved:
+                  if not t.exists() or (t.is_file() and t.stat().st_size == 0):
+                      raise Refused(f"missing or empty target: {t.name}")
+              env = {"PATH": "/usr/bin:/bin", "HOME": str(work), "NO_COLOR": "1", "LC_ALL": "C.UTF-8"}
+              listed = subprocess.run(
+                  [ruff, "check", "--config", str(config), "--no-cache", "--select", "S",
+                   "--show-files", *map(str, resolved)],
+                  cwd=work, env=env, capture_output=True, text=True, check=False)
+              files = {Path(line).resolve() for line in listed.stdout.splitlines() if line.strip()}
+              if listed.returncode != 0 or not files:
+                  raise Refused("zero files would be checked: vacuous scan")
+              if not all(any(f == t or t in f.parents for f in files) for t in resolved):
+                  raise Refused("an explicit target yields no checked file")
+              return run(config, resolved, work, "--ignore-noqa")
+
+
+          def refused(fn):
+              try:
+                  fn()
+              except Refused:
+                  return True
+              return False
+
+
+          for cfg in configs:
+              tag = f"[{cfg.parent.name}/{cfg.name}]"
+              keys = set(tomllib.loads(cfg.read_text()).get("tool", {}).get("ruff", {}) or
+                         tomllib.loads(cfg.read_text()))
+              check(f"{tag} config holds only line-length/target-version keys",
+                    keys <= {"line-length", "target-version"} and bool(keys))
+
+              t, w = case("bad", bad)
+              rc, r = governed(cfg, [t], w)
+              check(f"{tag} positive: unsuppressed S608 -> rc 1, codes == {{S608}}",
+                    rc == 1 and codes(r) == {"S608"})
+
+              t, w = case("noqa", suppressed_src)
+              rc, r = run(cfg, [t], w)
+              check(f"{tag} noqa: default shape suppressed (rc 0)", rc == 0 and codes(r) == set())
+              rc, r = governed(cfg, [t], w)
+              check(f"{tag} noqa: --ignore-noqa governed shape detects S608",
+                    rc == 1 and codes(r) == {"S608"})
+
+              t, w = case("clean", clean)
+              rc, r = governed(cfg, [t], w)
+              check(f"{tag} negative: parameterized companion -> rc 0, no findings",
+                    rc == 0 and codes(r) == set())
+
+              t, w = case("badcfg", bad)
+              broken = w / "broken.toml"
+              broken.write_text("line-length = [\n")
+              rc, r = run(broken, [t], w)
+              check(f"{tag} error exit: malformed config -> rc 2, distinct from findings rc 1 (rc={rc})",
+                    rc == 2)
+
+              t, w = case("empty")
+              check(f"{tag} fail-closed: empty directory target refused", refused(lambda: governed(cfg, [t], w)))
+              check(f"{tag} fail-closed: missing target refused",
+                    refused(lambda: governed(cfg, [t / "nope.py"], w)))
+              rc, r = run(cfg, [t], w)
+              check(f"{tag} why refusal exists: raw empty-dir scan is rc 0 (vacuous pass)", rc == 0)
+
+          print(f"failures: {len(failures)}")
+          sys.exit(1 if failures else 0)
+          PY
+          cd "$RUNNER_TEMP/ruff-cwd"
+          python3 -I "$RUNNER_TEMP/scripts/ruff_drill.py"
