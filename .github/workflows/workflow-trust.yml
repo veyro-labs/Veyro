@@ -71,7 +71,7 @@ permissions:
 
 jobs:
   workflow-trust-lint:
-    name: workflow-trust-lint-renamed
+    name: workflow-trust-lint
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
